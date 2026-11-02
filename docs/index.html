@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hermes Quota Status Bar: how much Codex, Anthropic and OpenCode Go you have left</title>
+<meta name="description" content="A Hermes Desktop status bar readout of remaining Codex, Anthropic and OpenCode Go quota. A credited fork of hermes-plugin-provider-usage.">
+<style>
+  :root {
+    --ink: #0b0f14;
+    --panel: #121922;
+    --line: #243040;
+    --text: #dfe7ee;
+    --dim: #a3b3c4;
+    --ok: #3fd6a4;
+    --warn: #f2b84b;
+    --bad: #ff6b5e;
+    --paper: #f3ecdc;
+    --paper-ink: #241d12;
+    --mono: ui-monospace, "Cascadia Mono", "SF Mono", Menlo, Consolas, monospace;
+    --serif: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0; background: var(--ink); color: var(--text);
+    font: 17px/1.6 var(--serif);
+    background-image:
+      radial-gradient(1200px 500px at 85% -10%, rgba(63,214,164,.10), transparent 60%),
+      repeating-linear-gradient(90deg, rgba(255,255,255,.025) 0 1px, transparent 1px 48px);
+  }
+  a { color: var(--ok); text-underline-offset: 3px; }
+  a:hover { color: #fff; }
+  .wrap { max-width: 980px; margin: 0 auto; padding: 0 24px; }
+
+  /* credit ribbon: first thing on the page, on purpose */
+  .credit {
+    background: var(--paper); color: var(--paper-ink);
+    border-bottom: 3px solid var(--paper-ink);
+    font: 15px/1.5 var(--serif);
+  }
+  .credit .wrap { padding-top: 11px; padding-bottom: 11px; display: flex; gap: 14px; align-items: baseline; flex-wrap: wrap; }
+  .credit strong { font-family: var(--mono); font-size: 12px; letter-spacing: .12em; text-transform: uppercase; background: var(--paper-ink); color: var(--paper); padding: 2px 8px; }
+  .credit a { color: var(--paper-ink); font-weight: 700; }
+
+  header { padding: 72px 0 36px; }
+  .tag { font: 12px var(--mono); letter-spacing: .18em; text-transform: uppercase; color: var(--dim); }
+  h1 { font-size: clamp(38px, 7vw, 76px); line-height: 1.02; margin: 14px 0 18px; font-weight: 700; letter-spacing: -.02em; }
+  h1 em { font-style: normal; color: var(--ok); }
+  .lede { max-width: 38em; font-size: 20px; color: #c3cfda; margin: 0 0 28px; }
+  .btns { display: flex; gap: 12px; flex-wrap: wrap; }
+  .btn { font: 600 14px var(--mono); padding: 12px 18px; border: 1px solid var(--ok); color: var(--ok); text-decoration: none; border-radius: 2px; }
+  .btn.solid { background: var(--ok); color: var(--ink); }
+  .btn:hover { background: #fff; color: var(--ink); border-color: #fff; }
+
+  /* the bezel around the real screenshot */
+  .bezel { margin: 22px 0 8px; padding: 14px 14px 10px; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; box-shadow: 0 24px 60px rgba(0,0,0,.5), inset 0 1px 0 rgba(255,255,255,.05); }
+  .bezel img { display: block; width: 100%; height: auto; border-radius: 3px; image-rendering: -webkit-optimize-contrast; }
+  .bezel figcaption { font: 12px var(--mono); color: var(--dim); padding-top: 10px; display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+  figure { margin: 0; }
+
+  /* decorative LED gauges, pure CSS */
+  .gauges { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin: 34px 0 0; }
+  .gauge { background: var(--panel); border: 1px solid var(--line); padding: 16px 16px 14px; border-radius: 4px; }
+  .gauge .n { font: 12px var(--mono); letter-spacing: .14em; text-transform: uppercase; color: var(--dim); }
+  .gauge .v { font: 700 34px var(--mono); margin: 4px 0 10px; }
+  .led { display: grid; grid-template-columns: repeat(20, 1fr); gap: 3px; height: 10px; }
+  .led i { background: #1b2531; border-radius: 1px; }
+  .led i.on { background: var(--c); box-shadow: 0 0 6px var(--c); }
+  .g1 { --c: var(--ok); } .g2 { --c: var(--bad); } .g3 { --c: var(--ok); }
+  .gauge small { display: block; font: 12px var(--mono); color: var(--dim); margin-top: 10px; }
+
+  section { padding: 54px 0 6px; }
+  h2 { font-size: 30px; margin: 0 0 6px; letter-spacing: -.01em; }
+  h2 span { font-family: var(--mono); font-size: 13px; color: var(--dim); margin-right: 10px; letter-spacing: .1em; }
+  .sub { color: var(--dim); margin: 0 0 24px; }
+  .cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 18px; }
+  .card { border-top: 2px solid var(--ok); padding: 14px 0 0; }
+  .card h3 { margin: 0 0 6px; font-size: 19px; }
+  .card p { margin: 0; color: #b9c6d2; font-size: 16px; }
+  .formula { overflow-wrap: anywhere; font: 15px var(--mono); background: var(--panel); border-left: 3px solid var(--warn); padding: 14px 18px; margin: 20px 0 0; color: #f6e3b4; overflow-x: auto; }
+
+  ol.steps { counter-reset: s; list-style: none; padding: 0; margin: 0; display: grid; gap: 12px; }
+  ol.steps li { counter-increment: s; padding: 14px 16px 14px 58px; position: relative; background: var(--panel); border: 1px solid var(--line); border-radius: 4px; }
+  ol.steps li::before { content: counter(s); position: absolute; left: 16px; top: 10px; font: 700 26px var(--mono); color: var(--ok); }
+  code, kbd { font-family: var(--mono); font-size: .86em; background: #1a2430; padding: 2px 6px; border-radius: 3px; color: #e6eef5; }
+  .limits { columns: 2 320px; column-gap: 36px; padding-left: 20px; }
+  .limits li { margin-bottom: 8px; break-inside: avoid; }
+
+  .thanks { margin: 56px 0 0; padding: 26px 28px; background: var(--paper); color: var(--paper-ink); border-radius: 4px; }
+  .thanks h2 { margin-top: 0; }
+  .thanks a { color: var(--paper-ink); font-weight: 700; }
+  .thanks code { background: rgba(0,0,0,.08); color: var(--paper-ink); }
+
+  footer { padding: 40px 0 60px; color: var(--dim); font: 13px/1.7 var(--mono); }
+  footer a { color: var(--dim); }
+  @media (max-width: 640px) { .gauges { grid-template-columns: 1fr; } header { padding-top: 44px; } }
+  @media (prefers-reduced-motion: no-preference) { .led i.on { animation: glow 3.2s ease-in-out infinite; } @keyframes glow { 50% { opacity: .78; } } }
+</style>
+</head>
+<body>
+
+<div class="credit">
+  <div class="wrap">
+    <strong>Fork</strong>
+    <span>Built on <a href="https://github.com/PhoeniXAbhisheK/hermes-plugin-provider-usage">hermes-plugin-provider-usage</a> by PhoeniXAbhisheK and its authors (MIT). The provider fetching is their work.</span>
+  </div>
+</div>
+
+<header>
+  <div class="wrap">
+    <div class="tag">Hermes Desktop plugin</div>
+    <h1>How much <em>quota</em> is left? Look down.</h1>
+    <p class="lede">One number per provider, in the status bar, all the time. Codex, Anthropic and OpenCode Go, each with a thin meter that turns amber and then red before you hit the wall.</p>
+    <div class="btns">
+      <a class="btn solid" href="https://github.com/itstomekk/hermes-quota-statusbar">Get it on GitHub</a>
+      <a class="btn" href="https://github.com/PhoeniXAbhisheK/hermes-plugin-provider-usage">Read the original</a>
+      <a class="btn" href="https://hermes-agent.nousresearch.com/docs">Hermes docs</a>
+    </div>
+
+    <figure class="bezel">
+      <img src="img/quota-bar.png" alt="Hermes Desktop status bar: Cron, then Codex 68%, Anthropic 16% and OpenCode 91% remaining, each with a thin colored meter underneath" width="1608" height="108">
+      <figcaption><span>The real status bar, cropped.</span><span>Codex 68% / Anthropic 16% / OpenCode 91% left</span></figcaption>
+    </figure>
+
+    <div class="gauges" aria-hidden="true">
+      <div class="gauge g1"><div class="n">Codex</div><div class="v">68%</div><div class="led"><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div><small>green: more than 50% left</small></div>
+      <div class="gauge g2"><div class="n">Anthropic</div><div class="v">16%</div><div class="led"><i class="on"></i><i class="on"></i><i class="on"></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div><small>red: under 20% left</small></div>
+      <div class="gauge g3"><div class="n">OpenCode</div><div class="v">91%</div><div class="led"><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i></i><i></i></div><small>plenty left, so green</small></div>
+    </div>
+  </div>
+</header>
+
+<main class="wrap">
+  <section>
+    <h2><span>01</span>What is different here</h2>
+    <p class="sub">Compared with upstream v0.3.1, which this repo is merged onto.</p>
+    <div class="cols">
+      <div class="card"><h3>Three providers, always remaining</h3><p>Codex, Anthropic and OpenCode Go only. No Used mode and no eye toggles, so the bar never changes shape on you.</p></div>
+      <div class="card"><h3>One honest number</h3><p>Weekly left times session left. A full 5-hour window does not hide an empty week.</p></div>
+      <div class="card"><h3>Countdown at zero</h3><p>When something hits 0% the bar adds the time until it resets, as hh:mm.</p></div>
+      <div class="card"><h3>Compact popover</h3><p>A Session and Weekly table, one row per Anthropic account. A silent account counts as 0% instead of vanishing.</p></div>
+      <div class="card"><h3>Codex stays visible</h3><p>When every Codex login is rate limited, the card stays at 0% with the reset time from Hermes' credential pool.</p></div>
+      <div class="card"><h3>Multi-account Anthropic</h3><p>Every Hermes OAuth login is queried, with Opus, Sonnet and credit rows when Anthropic reports them.</p></div>
+    </div>
+    <div class="formula">bar = session_left x weekly_left / 100     (Anthropic: mean over accounts; OpenCode: 0% if monthly is spent)</div>
+  </section>
+
+  <section>
+    <h2><span>02</span>Install</h2>
+    <p class="sub">Windows, Hermes Desktop. About two minutes.</p>
+    <ol class="steps">
+      <li><strong>Python half, as upstream says.</strong> Clone the repo into <code>$HERMES_HOME/plugins/provider-usage/</code>, then run <code>hermes plugins enable provider-usage</code>.</li>
+      <li><strong>Desktop half.</strong> Copy <code>desktop/plugin.js</code> to <code>%LOCALAPPDATA%\hermes\desktop-plugins\provider-usage\plugin.js</code>.</li>
+      <li><strong>Reload.</strong> Press <kbd>Ctrl</kbd>+<kbd>K</kbd> in Hermes Desktop and pick <em>Reload desktop plugins</em>.</li>
+    </ol>
+  </section>
+
+  <section>
+    <h2><span>03</span>Limits, plainly</h2>
+    <p class="sub">So nothing surprises you.</p>
+    <ul class="limits">
+      <li>Only Codex, Anthropic and OpenCode Go are drawn. The backend reads more providers; this widget does not show them.</li>
+      <li>Remaining capacity only. No Used mode.</li>
+      <li>No desktop notifications and no burn-rate projections in this layout.</li>
+      <li>Anthropic numbers come from an unofficial usage endpoint, so that card can go blank if Anthropic changes it.</li>
+      <li>Built and checked on Windows. macOS and Linux were not tried.</li>
+      <li>Keys are read from Hermes or the provider CLI at runtime. None are stored in this repo.</li>
+    </ul>
+  </section>
+
+  <div class="thanks">
+    <h2>Credit where it is due</h2>
+    <p>This project is a fork of <a href="https://github.com/PhoeniXAbhisheK/hermes-plugin-provider-usage">PhoeniXAbhisheK/hermes-plugin-provider-usage</a>. The fetchers for ten providers, the caching, the rate-limit handling and the original widget are the work of its authors, released under the MIT license. This fork adds a compact layout on top and keeps their license and history intact. If you want the full multi-provider widget, install the original.</p>
+    <p>Fork: <a href="https://github.com/itstomekk/hermes-quota-statusbar">github.com/itstomekk/hermes-quota-statusbar</a></p>
+  </div>
+</main>
+
+<footer>
+  <div class="wrap">
+    MIT licensed. Original work by its authors, changes in this fork by Tomek Kolodziejczuk.<br>
+    <a href="https://github.com/itstomekk/hermes-quota-statusbar">This repo</a> ·
+    <a href="https://github.com/PhoeniXAbhisheK/hermes-plugin-provider-usage">Upstream</a> ·
+    <a href="https://hermes-agent.nousresearch.com/docs">Hermes docs</a>
+  </div>
+</footer>
+</body>
+</html>
