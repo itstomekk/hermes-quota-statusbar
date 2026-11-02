@@ -285,7 +285,53 @@ def fetch_opencode_go():
     return {"id": "opencode-go", "status": "ok", "windows": windows}
 
 
+def _codex_limit_fallback():
+    """0%-remaining Codex card from the credential pool's own 429 record.
+
+    Hermes' account-usage helper and the usage endpoint answer nothing once the
+    plan is exhausted, which hid the card. The pool already records when the
+    limit lifts (``last_error_reset_at``), so keep the card with its reset time.
+    Only when EVERY OAuth entry is exhausted with a future reset; live usage
+    data always wins and nothing is invented otherwise. A reset further than
+    five hours away can only be the weekly window.
+    """
+    rows = [r for r in _auth_json_pool_entries("openai-codex") if r.get("auth_type") == "oauth"]
+    if not rows:
+        return None
+    now = time.time()
+    resets = []
+    for row in rows:
+        reset = row.get("last_error_reset_at")
+        if row.get("last_status") != "exhausted" or isinstance(reset, bool) \
+                or not isinstance(reset, (int, float)) or reset <= now:
+            return None
+        resets.append(float(reset))
+    soonest = min(resets)
+    label = "5h" if soonest - now <= 5 * 3600 else "7d"
+    return {
+        "id": "openai-codex", "status": "ok",
+        "windows": [{
+            "label": label, "percent": 100.0, "status": "ok",
+            "resets_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(soonest)),
+        }],
+    }
+
+
 def fetch_openai_codex():
+    try:
+        return _fetch_openai_codex_live()
+    except _Skip:
+        pass
+    except Exception:
+        if _codex_limit_fallback() is None:
+            raise
+    limited = _codex_limit_fallback()
+    if limited is None:
+        raise _Skip("openai-codex")
+    return limited
+
+
+def _fetch_openai_codex_live():
     # Hermes sign-in first (auth store + credential pool), then the Codex CLI store.
     payload = _hermes_usage("openai-codex")
     if payload is not None:
@@ -449,6 +495,106 @@ def _hermes_usage(provider):
     return _last_reading(provider, cached)
 
 
+def _auth_json_pool_entries(provider):
+    """Read-only fallback: the profile's auth.json credential pool rows.
+
+    Used when ``load_pool`` itself fails, e.g. UnscopedSecretError inside the
+    multiplexed dashboard backend (it seeds from ANTHROPIC_TOKEN)."""
+    try:
+        from hermes_constants import get_hermes_home
+        path = get_hermes_home() / "auth.json"
+    except Exception:
+        path = HOME / ".hermes" / "auth.json"
+    try:
+        rows = (json.loads(path.read_text(encoding="utf-8")).get("credential_pool") or {}).get(provider) or []
+    except (OSError, ValueError, AttributeError):
+        return []
+    if isinstance(rows, dict):
+        rows = list(rows.values())
+    return [r for r in rows if isinstance(r, dict)]
+
+
+def _auth_json_anthropic_entries():
+    return _auth_json_pool_entries("anthropic")
+
+
+def _hermes_anthropic_oauth_accounts():
+    """(label, access_token) for every Hermes Anthropic OAuth pool entry.
+
+    Read-only: no logging, refreshing or rotating credentials. Only OAuth
+    entries work at the subscription usage endpoint, never API keys. Any
+    failure of Hermes' pool loader (including the RuntimeError raised for an
+    unscoped secret read) falls back to reading auth.json directly.
+    """
+    pairs = []
+    try:
+        from agent.credential_pool import load_pool
+        for e in load_pool("anthropic").entries():
+            if getattr(e, "auth_type", None) == "oauth":
+                pairs.append((getattr(e, "label", None), getattr(e, "access_token", None)))
+    except Exception:
+        pairs = [
+            (r.get("label"), r.get("access_token"))
+            for r in _auth_json_anthropic_entries()
+            if r.get("auth_type") == "oauth"
+        ]
+    seen, out = set(), []
+    for label, token in pairs:
+        if not isinstance(token, str) or not token or token in seen:
+            continue
+        seen.add(token)
+        out.append((str(label or "account %d" % (len(out) + 1)), token))
+    return out
+
+
+def _hermes_anthropic_oauth_tokens():
+    """OAuth access tokens only (see _hermes_anthropic_oauth_accounts)."""
+    return [token for _, token in _hermes_anthropic_oauth_accounts()]
+
+
+def _short_account(label):
+    label = str(label or "").strip()
+    if label.lower().startswith("anthropic-"):
+        label = label[len("anthropic-"):]
+    return label[:16] or "account"
+
+
+_ANTHROPIC_WINDOWS = (
+    ("five_hour", "5h"),
+    ("seven_day", "7d"),
+    ("seven_day_opus", "7d Opus"),
+    ("seven_day_sonnet", "7d Sonnet"),
+)
+
+
+def _anthropic_rows(d):
+    """Ratio windows plus dollar-capped credit rows from one usage body."""
+    windows = []
+    for key, label in _ANTHROPIC_WINDOWS:
+        w = d.get(key)
+        if not isinstance(w, dict):
+            continue
+        percent = _num(w.get("utilization"))
+        if percent is None:
+            percent = 0.0  # show 0% when utilization is missing but the window exists
+        resets = w.get("resets_at")
+        windows.append({
+            "label": label,
+            "percent": round(max(0.0, min(100.0, percent)), 1),
+            "resets_at": resets if isinstance(resets, str) else None,
+            "status": "ok",
+        })
+    money = []
+    for key, w in d.items():
+        if not isinstance(w, dict):
+            continue
+        limit, used = _num(w.get("limit_dollars")), _num(w.get("used_dollars"))
+        if limit is None or used is None or limit <= 0:
+            continue
+        money.append({"label": "Credits", "left": round(limit - used, 2), "total": round(limit, 2), "cur": "USD"})
+    return windows, money
+
+
 def _claude_code_oauth_token():
     """Claude Code OAuth access token from ~/.claude/.credentials.json.
 
@@ -471,47 +617,59 @@ def _claude_code_oauth_token():
 
 
 def fetch_anthropic():
-    """Anthropic quota windows: Hermes sign-in first, Claude Code fallback.
+    """Anthropic quota windows for every OAuth account, Claude Code fallback.
 
-    Hermes' account-usage helper can return nothing inside the desktop plugin
-    host, which used to hide the card entirely. Claude Code keeps its own
-    OAuth token on disk, so GET /api/oauth/usage (anthropic-beta:
-    oauth-2025-04-20) answers with ratio windows even then. No Hermes data
-    and no Claude Code credentials means the provider is unconfigured and
-    stays hidden.
+    Each Hermes OAuth pool entry (plus a distinct Claude Code login) is probed
+    at GET /api/oauth/usage (anthropic-beta: oauth-2025-04-20). With more than
+    one answering account, rows are prefixed with the account label so both
+    subscriptions show side by side. Hermes' account-usage helper (active
+    account only) is used only when the pool has no OAuth entries. A rejected
+    token drops only that account; nothing usable means the provider hides.
     """
-    payload = _hermes_usage("anthropic")
-    if payload is not None:
-        return payload
-    token = _claude_code_oauth_token()
-    if not token:
+    accounts = list(_hermes_anthropic_oauth_accounts())
+    if not accounts:
+        payload = _hermes_usage("anthropic")
+        if payload is not None:
+            return payload
+    cli_token = _claude_code_oauth_token()
+    if cli_token and cli_token not in [t for _, t in accounts]:
+        accounts.append(("Claude Code", cli_token))
+    if not accounts:
         raise _Skip("anthropic")
-    d = _http_json(
-        "https://api.anthropic.com/api/oauth/usage",
-        {
-            "Authorization": "Bearer " + token,
-            "anthropic-beta": "oauth-2025-04-20",
-            "Accept": "application/json",
-        },
-    )
-    windows = []
-    for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
-        w = d.get(key)
-        if not isinstance(w, dict):
+    answered, errors = [], []
+    for label, token in accounts:
+        try:
+            d = _http_json(
+                "https://api.anthropic.com/api/oauth/usage",
+                {
+                    "Authorization": "Bearer " + token,
+                    "anthropic-beta": "oauth-2025-04-20",
+                    "Accept": "application/json",
+                },
+            )
+        except Exception as exc:
+            errors.append(exc)
             continue
-        percent = _num(w.get("utilization"))
-        if percent is None:
-            continue  # missing metric: skip the row, never a fabricated 0%
-        resets = w.get("resets_at")
-        windows.append({
-            "label": label,
-            "percent": round(max(0.0, min(100.0, percent)), 1),
-            "resets_at": resets if isinstance(resets, str) else None,
-            "status": "ok",
-        })
-    if not windows:
+        windows, money = _anthropic_rows(d if isinstance(d, dict) else {})
+        if windows or money:
+            answered.append((label, windows, money))
+    if not answered:
+        if errors:
+            # a service error outranks "token rejected" as the explanation
+            raise next((e for e in errors if not isinstance(e, PermissionError)), errors[-1])
         raise _Skip("anthropic")
-    return {"id": "anthropic", "status": "ok", "windows": windows}
+    multi = len(answered) > 1
+    windows, money = [], []
+    for label, ws, ms in answered:
+        prefix = _short_account(label) + " · " if multi else ""
+        for row in ws + ms:
+            row["label"] = prefix + row["label"]
+        windows.extend(ws)
+        money.extend(ms)
+    out = {"id": "anthropic", "status": "ok", "windows": windows}
+    if money:
+        out["money"] = money
+    return out
 
 
 def _nous_credit_rows(info):

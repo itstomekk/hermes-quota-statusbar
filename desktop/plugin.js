@@ -1,28 +1,19 @@
 /**
- * Provider Usage: desktop status-bar item (right cluster).
+ * Provider Usage: desktop status-bar item (left cluster, after Cron).
  *
  * Data: this plugin's own backend namespace
  * (/api/plugins/provider-usage/usage, served by dashboard/plugin_api.py),
  * so provider credentials stay on the local machine.
  *
- * Each provider header carries an eye toggle that shows/hides that provider
- * in the status bar; until one is touched, only the first provider shows.
- *
- * Registered as a DATA contribution, so the app renders it with the exact
- * same chrome as the core context-usage gauge; `variant: 'menu'` opens the
- * popover: dense per-provider rows, a Used/Remaining value selector
- * (bottom-right, instant) and a refresh-interval picker (30s/1m/5m/10m).
- * Every scheduled poll refreshes the underlying values (?fresh=1).
- *
- * Near-limit tint: any window or the OpenRouter key cap at >= 80% used
- * renders amber in the bar and in the popover rows.
- *
- * Native notification (ctx.os.notify) fires once per threshold crossing,
- * deduped per window cycle (keyed by reset time) and per day for the cap.
- *
- * Burn-rate projections: the backend reports `eta_seconds` /
- * `depletes_in_seconds` from observed history; rows show "~2d" when a
- * window would hit 100% before its reset (or a cap depletes soon).
+ * Compact layout (this fork): Codex, Anthropic and OpenCode Go, always Remaining.
+ * OpenCode Go uses the Codex product (5h × weekly); monthly only matters at 0%.
+ * Bottom bar: weekly remaining × session remaining / 100. Anthropic is
+ * the mean of the per-account products (one per signed-in account), rounded
+ * once at display time.
+ * Popover: account rows with Session / Weekly values and reset times.
+ * Missing Weekly data falls back to Session for the combined calculation.
+ * Missing raw metrics still display as unknown in the account table.
+ * Polling and threshold alerts continue through the existing backend.
  */
 import { STATUSBAR_AREAS, atom, useQuery, useQueryClient, useValue } from '@hermes/plugin-sdk'
 import { jsx, jsxs } from 'react/jsx-runtime'
@@ -41,10 +32,18 @@ const INTERVALS = [
 /* Plugin-local state: poll cadence + value mode. Persisted via ctx.storage
  * (namespaced under hermes.plugin.provider-usage.*) so they survive restarts. */
 const $interval = atom(300000)
-const $mode = atom('used') // 'used' | 'remaining'
+const $mode = atom('remaining') // 'used' | 'remaining'
 /* Which providers appear in the status bar. null = default (first provider
  * only); an array of ids = an explicit choice from the panel's eye toggles. */
-const $barProviders = atom(null)
+const $barProviders = atom(['openai-codex', 'anthropic', 'opencode-go'])
+
+/* Optional: pin Anthropic accounts to short names. Keys are the account labels
+ * the backend prefixes onto window names ("<label> · 5h"); values are what the
+ * panel shows. Leave empty to show every signed-in account as A1, A2, ... in
+ * the order returned. When pinned, an account that does not answer keeps its
+ * row and counts as 0%, and any other login (e.g. a Claude Code CLI login) is
+ * left out of the average. Example: { 'work': 'A1', 'personal': 'A2' } */
+let ACCOUNT_ALIASES = {}
 
 const STORE_INTERVAL = 'intervalMs'
 const STORE_MODE = 'valueMode'
@@ -72,7 +71,8 @@ function bindStorage(s) {
     const mode = storage.get(STORE_MODE, null)
     if (mode === 'used' || mode === 'remaining') $mode.set(mode)
     const bar = storage.get(STORE_BAR, null)
-    if (Array.isArray(bar)) $barProviders.set(bar)
+    // The compact layout always shows these three, regardless of old settings.
+    $barProviders.set(['openai-codex', 'anthropic', 'opencode-go'])
   } catch (e) {
     /* ignore malformed persisted state */
   }
@@ -100,7 +100,11 @@ function useUsage() {
 /* ---------- formatting / prediction helpers ---------- */
 
 const CUR = { USD: '$', CNY: '\u00a5' }
-const money = (v, cur) => (CUR[cur] || '$') + Number(v).toFixed(2)
+const money = (v, cur) => {
+  const n = Number(v) || 0
+  const sign = n < 0 ? '-' : ''
+  return sign + (CUR[cur] || '$') + Math.abs(n).toFixed(2)
+}
 const pct = v => Math.round(Number(v) || 0) + '%'
 const CODE = {
   'opencode-go': 'opencode',
@@ -114,7 +118,91 @@ const CODE = {
   minimax: 'minimax',
   deepseek: 'deepseek'
 }
-const code = p => CODE[p.id] || p.id
+const code = p => p.id === 'openai-codex' ? 'Codex' : p.id === 'anthropic' ? 'Anthropic' : p.id === 'opencode-go' ? 'OpenCode' : (CODE[p.id] || p.id)
+const DISPLAY_IDS = ['openai-codex', 'anthropic', 'opencode-go']
+const DISPLAY_NAMES = { 'openai-codex': 'Codex', anthropic: 'Anthropic', 'opencode-go': 'OpenCode' }
+
+function displayProviders(data) {
+  const providers = data && Array.isArray(data.providers) ? data.providers : []
+  return DISPLAY_IDS.map(id => providers.find(p => p.id === id) || {
+    id, name: DISPLAY_NAMES[id], status: 'unavailable', windows: []
+  })
+}
+
+// The backend prefixes multi-account windows with its account label. Keep that
+// identity for grouping, but expose only short names (A1, A2, ...) and the two quota windows.
+function quotaAccounts(p) {
+  const accounts = new Map()
+  const aliases = ACCOUNT_ALIASES
+  for (const w of p.windows || []) {
+    const match = String(w.label || '').match(/^(?:(.*?) · )?(5h|session|7d|weekly|monthly)$/i)
+    if (!match) continue
+    const key = match[1] || ''
+    if (!accounts.has(key)) accounts.set(key, {
+      label: p.id === 'anthropic' ? (aliases[key] || 'A' + (accounts.size + 1)) : p.id === 'opencode-go' ? 'OpenCode' : 'Codex'
+    })
+    const window = /^(5h|session)$/i.test(match[2]) ? 'session' : /^monthly$/i.test(match[2]) ? 'monthly' : 'weekly'
+    accounts.get(key)[window] = w
+  }
+  // With pinned aliases, a distinct CLI login may be returned too: it is not
+  // one of the pinned accounts and must not enter their mean or replace one.
+  // A pinned account the backend did not return (rate-limited, rejected)
+  // still gets its row, flagged missing; it counts as 0% remaining.
+  const selected = Object.keys(aliases).filter(key => accounts.has(key))
+  const rows = p.id === 'anthropic' && selected.length
+    ? Object.keys(aliases).map(key => accounts.get(key) || { label: aliases[key], missing: true })
+    : [...accounts.values()]
+  return rows.sort((a, b) => a.label.localeCompare(b.label, undefined, { numeric: true }))
+}
+
+function remaining(w) {
+  if (!w || typeof w.percent !== 'number' || !Number.isFinite(w.percent)) return null
+  return 100 - Math.max(0, Math.min(100, w.percent))
+}
+
+function combinedRemaining(p) {
+  if (!p || p.status !== 'ok') return null
+  const accounts = quotaAccounts(p)
+  const pinned = Object.keys(ACCOUNT_ALIASES).length
+  const expected = p.id === 'anthropic' ? (pinned || accounts.length) : 1
+  if (!accounts.length || accounts.length !== expected) return null
+  const products = accounts.map(a => {
+    if (a.missing) return 0
+    // OpenCode Go: same session × weekly product as Codex, but an exhausted
+    // monthly cap still blocks everything, so it forces 0.
+    if (p.id === 'opencode-go' && remaining(a.monthly) === 0) return 0
+    const session = remaining(a.session), weekly = remaining(a.weekly)
+    // An exhausted weekly window is 0% whatever the session reports (or omits).
+    if (weekly === 0) return 0
+    if (session === null) return null
+    return weekly === null ? session : session * weekly / 100
+  })
+  if (products.some(v => v === null)) return null
+  return products.reduce((sum, v) => sum + v, 0) / products.length
+}
+
+// hh:mm until capacity returns, only while the provider is fully exhausted.
+// An account is blocked until every exhausted window of it has reset; the
+// provider is back when its first account is. Unknown resets are never guessed.
+function resetTimer(p, now = Date.now()) {
+  if (combinedRemaining(p) !== 0) return null
+  let soonest = null
+  for (const a of quotaAccounts(p)) {
+    if (a.missing) continue // no reading, so no reset time to wait for
+    let back = -Infinity
+    for (const w of [a.session, a.weekly, a.monthly]) {
+      if (remaining(w) !== 0) continue
+      const t = Date.parse(w.resets_at)
+      if (!Number.isFinite(t)) return null
+      back = Math.max(back, t)
+    }
+    if (back === -Infinity) return null
+    soonest = soonest === null ? back : Math.min(soonest, back)
+  }
+  if (soonest === null || soonest <= now) return null
+  const minutes = Math.ceil((soonest - now) / 60000)
+  return String(Math.floor(minutes / 60)).padStart(2, '0') + ':' + String(minutes % 60).padStart(2, '0')
+}
 
 function etaText(iso) {
   if (!iso) return ''
@@ -210,7 +298,7 @@ function checkAlerts(data) {
       }
     }
 
-    for (const p of data.providers) {
+    for (const p of displayProviders(data)) {
       if (p.status !== 'ok') continue
       for (const w of p.windows || []) {
         const u = usedPercentOf(w)
@@ -255,243 +343,154 @@ function checkAlerts(data) {
   }
 }
 
-/* One-line summary for the bar, in the CURRENT value mode:
- * quota providers show their 5h (rolling) window, used or remaining;
- * OpenRouter shows its key-cap amount (used or left). */
-function summary(p, mode) {
-  if (!p || p.status !== 'ok') return '-'
-  const used = mode !== 'remaining'
-  const moneyRows = Array.isArray(p.money) ? p.money : []
-  if (moneyRows.length) {
-    const cap = moneyRows.find(m => m.label === 'Key cap') || moneyRows[0]
-    const total = Number(cap.total) || 0
-    const left = Number(cap.left) || 0
-    if (total > 0) return money(used ? Math.max(0, total - left) : left, cap.cur)
-    return money(left, cap.cur)
-  }
-  const wins = Array.isArray(p.windows) ? p.windows : []
-  const win = wins.find(w => w.label === '5h') || wins[0]
-  const u = usedPercentOf(win)
-  return Math.round(used ? u : 100 - u) + '%'
+/* Bottom bar is always combined REMAINING capacity, never Used mode. */
+function summary(p) {
+  const value = combinedRemaining(p)
+  return value === null ? '-' : pct(value)
 }
 
-/* ---------- bar item (live) ---------- */
+function remainingColor(value) {
+  if (value === null) return 'var(--ui-text-quaternary)'
+  if (value < 20) return 'var(--dt-destructive)'
+  if (value <= 50) return 'var(--color-amber-500)'
+  return 'var(--ui-success)'
+}
+
+function RemainingMeter({ name, value }) {
+  const color = remainingColor(value)
+  return jsx('span', {
+    role: 'progressbar',
+    'aria-label': name + ' remaining capacity',
+    'aria-valuemin': 0,
+    'aria-valuemax': 100,
+    'aria-valuenow': value === null ? undefined : value,
+    'aria-valuetext': value === null ? 'Usage unavailable' : pct(value) + ' remaining',
+    style: {
+      display: 'block', width: '100%', height: 3, borderRadius: 3, overflow: 'hidden',
+      background: value === null ? 'transparent' : 'color-mix(in srgb, ' + color + ' 40%, transparent)'
+    },
+    // Unknown shows a dim full bar so the slot never looks missing.
+    children: value === null
+      ? jsx('span', { style: { display: 'block', height: '100%', width: '100%', background: 'var(--ui-text-tertiary)', opacity: 0.45 } })
+      : jsx('span', { style: { display: 'block', height: '100%', width: value + '%', background: color } })
+  })
+}
 
 function BarDetail() {
   const { data, isError } = useUsage()
-  const mode = useValue($mode)
-  const barSet = useValue($barProviders)
-
+  useEffect(() => { if (data) checkAlerts(data) }, [data])
+  // Re-render every 30s so a countdown keeps ticking between data refreshes.
+  const [, setTick] = useState(0)
   useEffect(() => {
-    if (data) checkAlerts(data)
-  }, [data])
-
-  if (isError) return 'backend down'
-  if (!data) return '…'
-  const provs = data.providers || []
-  const visible = barSet === null
-    ? provs.slice(0, 1)
-    : provs.filter(p => barSet.indexOf(p.id) !== -1)
-  const parts = []
-  visible.forEach((p, i) => {
-    if (i) parts.push(' · ')
-    parts.push(jsx('span', {
-      key: p.id,
-      className: providerWarn(p) ? 'text-amber-600' : undefined,
-      children: code(p) + ' ' + summary(p, mode)
-    }))
+    const id = setInterval(() => setTick(n => n + 1), 30000)
+    return () => clearInterval(id)
+  }, [])
+  const providers = displayProviders(isError ? null : data)
+  return jsx('span', {
+    style: { display: 'inline-flex', alignItems: 'center', gap: 9, color: 'var(--ui-text-tertiary)', fontVariantNumeric: 'tabular-nums' },
+    children: providers.map(p => {
+      const value = combinedRemaining(p)
+      const timer = resetTimer(p)
+      return jsxs('span', {
+        key: p.id,
+        style: { display: 'inline-flex', flexDirection: 'column', gap: 2, minWidth: 72 },
+        children: [
+          jsx('span', { style: { whiteSpace: 'nowrap', lineHeight: '12px' }, children: code(p) + ' ' + summary(p) + (timer ? ' · ' + timer : '') }),
+          jsx(RemainingMeter, { name: code(p), value })
+        ]
+      })
+    })
   })
-  // The host renders plugin detail content in text-muted-foreground/80 (a
-  // double-dimmed tone); force the same token built-in statusbar values use.
-  return jsx('span', { style: { color: 'var(--ui-text-tertiary)' }, children: parts })
-}
-
-function tipLine(p, mode) {
-  if (p.status !== 'ok') return 'unavailable'
-  const used = mode !== 'remaining'
-  const moneyRows = Array.isArray(p.money) ? p.money : []
-  if (moneyRows.length) {
-    return moneyRows.map(m => {
-      const total = Number(m.total) || 0
-      const left = Number(m.left) || 0
-      const amt = total > 0 ? (used ? Math.max(0, total - left) : left) : left
-      const label = used && total > 0 ? (MONEY_LABEL_USED[m.label] || m.label) : m.label
-      const d = Number(m.depletes_in_seconds)
-      const tag = isFinite(d) && d > 0 ? ' (' + fmtEta(d) + ')' : ''
-      const amount = money(amt, m.cur) + (total > 0 ? '/' + money(total, m.cur) : '')
-      return label + ' ' + amount + tag
-    }).join(' · ')
-  }
-  return (p.windows || []).map(w => {
-    const u = usedPercentOf(w)
-    const e = Number(w.eta_seconds)
-    const tag = isFinite(e) && e > 0 ? ' (' + fmtEta(e) + ')' : ''
-    return w.label + ' ' + pct(used ? u : 100 - u) + tag
-  }).join(' · ')
 }
 
 function BarTip() {
   const { data } = useUsage()
-  const mode = useValue($mode)
-  const rows = data && Array.isArray(data.providers) ? data.providers : []
   return jsxs('div', {
-    style: { display: 'flex', flexDirection: 'column', gap: 2, minWidth: 235, fontSize: 11, textAlign: 'left' },
-    children: rows.length
-      ? rows.map(p =>
-          jsxs('div', {
-            key: p.id,
-            style: { display: 'flex', justifyContent: 'space-between', gap: 12 },
-            children: [
-              jsx('span', { style: { fontWeight: 600 }, children: p.name }),
-              jsx('span', { style: { opacity: 0.8, fontVariantNumeric: 'tabular-nums' }, children: tipLine(p, mode) })
-            ]
-          })
-        )
-      : [jsx('div', {
-          key: data ? 'empty' : 'load',
-          children: data ? 'Provider usage: no providers available' : 'Provider usage: loading…'
-        })]
+    style: { fontSize: 11, display: 'flex', flexDirection: 'column', gap: 4 },
+    children: [
+      ...displayProviders(data).map(p => {
+        const timer = resetTimer(p)
+        return jsx('div', { key: p.id, children: code(p) + ' ' + summary(p) + ' remaining' + (timer ? ' · resets in ' + timer : '') })
+      }),
+      jsx('div', { style: { opacity: 0.7 }, children: 'Weekly × session; session only if weekly is unavailable. Anthropic: average of all signed-in accounts. OpenCode: same product; 0% if monthly is exhausted.' })
+    ]
   })
 }
 
-/* ---------- popover panel ---------- */
-
+/* ---------- compact quota table ---------- */
 const MONO = 'tabular-nums'
 
-function Row({ label, value, width, meta, warn, eta }) {
-  const raw = Number(width)
-  const w = isFinite(raw) && raw > 0 ? Math.max(3, Math.min(100, raw)) : 0
-  return jsxs('div', {
-    style: { display: 'flex', alignItems: 'center', gap: 8, padding: '2px 4px', margin: '0 -4px', borderRadius: 5 },
+function QuotaCell({ window }) {
+  const value = remaining(window)
+  const warn = value !== null && value <= 20
+  return jsxs('td', {
+    style: { width: '40%', padding: '7px 0 7px 16px', verticalAlign: 'top' },
+    title: value === null ? 'Usage unavailable' : etaText(window.resets_at),
     children: [
-      jsx('span', {
-        style: { width: 72, flex: 'none', fontSize: 12, opacity: 0.75, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' },
-        children: label
+      jsx('div', {
+        style: { display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: 6 },
+        children: [
+          jsx('span', { style: { fontWeight: 600, fontSize: 13, fontVariantNumeric: MONO }, className: warn ? 'text-amber-600' : undefined, children: value === null ? '-' : pct(value) }),
+          jsx('span', { style: { fontSize: 10, color: 'var(--ui-text-tertiary)', whiteSpace: 'nowrap' }, children: value === null ? '' : etaText(window.resets_at).replace('resets in ', '') })
+        ]
       }),
-      jsx('span', {
-        style: { flex: '1 1 auto', height: 3, borderRadius: 3, background: 'var(--ui-stroke-tertiary, rgba(128,132,144,.25))', overflow: 'hidden' },
-        children: w > 0
-          ? jsx('span', {
-              style: { display: 'block', height: '100%', width: w + '%', borderRadius: 3, background: 'var(--ui-accent, #6f9dff)', opacity: 0.9 }
-            })
-          : null
-      }),
-      jsx('span', {
-        style: { width: 48, flex: 'none', textAlign: 'right', fontWeight: 600, fontSize: 12, fontVariantNumeric: MONO },
-        className: warn ? 'text-amber-600' : undefined,
-        children: value
-      }),
-      jsx('span', {
-        style: { width: 112, flex: 'none', textAlign: 'right', fontSize: 11, opacity: 0.7, fontVariantNumeric: MONO, whiteSpace: 'nowrap' },
-        children: eta
-          ? [meta, jsx('span', { key: 'eta', className: 'text-amber-600', style: { marginLeft: 4 }, children: eta })]
-          : meta
+      jsx('div', {
+        style: { height: 3, marginTop: 5, borderRadius: 3, background: 'var(--ui-stroke-tertiary)', overflow: 'hidden' },
+        children: value === null ? null : jsx('div', { style: { height: '100%', width: value + '%', background: 'var(--ui-accent)', opacity: warn ? 0.5 : 0.9 } })
       })
     ]
   })
 }
 
-/* Money-row headings flip with the value mode so the number can never lie:
- * "Balance $9.02" would read as a balance; "Spent $9.02" reads as used. */
-const MONEY_LABEL_USED = { Balance: 'Spent', 'Key cap': 'Cap used' }
+const clockTime = v => new Date(v).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
 
-const EYE_PATH = 'M2.062 12.348a1 1 0 0 1 0-.696 10.75 10.75 0 0 1 19.876 0 1 1 0 0 1 0 .696 10.75 10.75 0 0 1-19.876 0'
-
-function EyeIcon({ off }) {
-  return jsx('svg', {
-    viewBox: '0 0 24 24', width: 13, height: 13, fill: 'none', stroke: 'currentColor',
-    strokeWidth: 2, strokeLinecap: 'round', strokeLinejoin: 'round', style: { display: 'block' },
-    children: [
-      jsx('path', { key: 'eye', d: EYE_PATH }),
-      jsx('circle', { key: 'pupil', cx: 12, cy: 12, r: 3 }),
-      off ? jsx('path', { key: 'slash', d: 'm3 3 18 18' }) : null
-    ]
+function ProviderBlock({ p, first }) {
+  const accounts = quotaAccounts(p)
+  const pinnedNames = Object.values(ACCOUNT_ALIASES)
+  const placeholders = p.id === 'anthropic' ? (pinnedNames.length ? pinnedNames : ['A1']) : [code(p)]
+  const rows = accounts.length ? accounts : placeholders.map(label => ({ label }))
+  const heading = label => jsx('th', {
+    key: label, scope: 'col',
+    style: { textAlign: 'left', padding: '0 0 3px 16px', fontSize: 10, fontWeight: 500, color: 'var(--ui-text-tertiary)' },
+    children: label
   })
-}
-
-/* Eye toggle: shows/hides one provider in the status bar. */
-function BarToggle({ p, ids }) {
-  const set = useValue($barProviders)
-  const on = barVisible(set, p.id, ids)
-  return jsx('button', {
-    type: 'button',
-    title: on ? 'Hide from status bar' : 'Show in status bar',
-    'aria-label': on ? 'Hide from status bar' : 'Show in status bar',
-    onClick: () => toggleBarProvider(p.id, ids),
-    style: {
-      display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
-      width: 16, height: 20, padding: 0, border: 'none', borderRadius: 5,
-      background: 'transparent', color: 'inherit', cursor: 'pointer',
-      opacity: on ? 1 : 0.6, transform: 'translate(-1.5px, -2px)'
-    },
-    children: jsx(EyeIcon, { off: !on })
-  })
-}
-
-function ProviderBlock({ p, first, mode, ids }) {
-  const used = mode === 'used'
-  const rows = []
-  if (p.status !== 'ok') {
-    rows.push(jsx('div', { key: 'err', style: { fontSize: 11, opacity: 0.8 }, children: 'unavailable: ' + (p.error || 'fetch failed') }))
-  }
-  if (p.stale && (p.hold_until || p.fetched_at)) {
-    const clock = (v) => new Date(v).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-    const bits = []
-    if (p.fetched_at) bits.push('last reading ' + clock(p.fetched_at))
-    if (p.hold_until) bits.push('retry after ' + clock(p.hold_until))
-    rows.push(jsx('div', { key: 'stale', style: { fontSize: 11, opacity: 0.8 }, children: bits.join(' · ') }))
-  }
-  for (const w of p.windows || []) {
-    const usedPct = usedPercentOf(w)
-    const shown = used ? usedPct : 100 - usedPct
-    const aEta = actionableEta(w)
-    rows.push(jsx(Row, {
-      key: 'w' + w.label,
-      label: w.label,
-      value: pct(shown),
-      width: shown,
-      meta: etaText(w.resets_at),
-      warn: usedPct >= WARN_PCT,
-      eta: aEta ? fmtEta(aEta) : null
-    }))
-  }
-  for (const m of p.money || []) {
-    const total = Number(m.total) || 0
-    const left = Number(m.left) || 0
-    const shown = total > 0 ? (used ? Math.max(0, total - left) : left) : left
-    const d = Number(m.depletes_in_seconds)
-    const aEta = isFinite(d) && d > 0 && d < 14 * 86400 ? d : null
-    rows.push(jsx(Row, {
-      key: 'm' + m.label,
-      label: used && total > 0 ? (MONEY_LABEL_USED[m.label] || m.label) : m.label,
-      value: money(shown, m.cur),
-      width: total > 0 ? (shown / total) * 100 : 0,
-      meta: total > 0 ? '/ ' + money(total, m.cur) : '',
-      warn: m.label === 'Key cap' && capUsedPercent(m) >= WARN_PCT,
-      eta: aEta ? fmtEta(aEta) : null
-    }))
-  }
-  return jsxs('div', {
-    style: {
-      display: 'flex', flexDirection: 'column', gap: 3,
-      borderTop: first ? 'none' : '1px solid var(--ui-stroke-tertiary, #3a3f4a)',
-      paddingTop: first ? 0 : 6
-    },
+  return jsxs('section', {
+    style: { borderTop: first ? 'none' : '1px solid var(--ui-stroke-tertiary)', paddingTop: first ? 0 : 12 },
     children: [
       jsxs('div', {
-        style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 1 },
+        style: { display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 8 },
         children: [
-          jsxs('span', {
-            style: { display: 'inline-flex', alignItems: 'center', gap: 1 },
-            children: [
-              jsx(BarToggle, { p, ids }),
-              jsx('span', { style: { fontSize: 11, letterSpacing: '0.1em', textTransform: 'uppercase', opacity: 0.75 }, children: p.name })
-            ]
-          }),
-          jsx('span', { style: { fontSize: 11, opacity: 0.6 }, children: p.tag || '' })
+          jsx('span', { style: { fontWeight: 600, fontSize: 12 }, children: code(p) }),
+          jsx('span', { style: { color: 'var(--ui-text-tertiary)', fontSize: 11, fontVariantNumeric: MONO }, title: 'Weekly remaining × session remaining; session only if weekly is unavailable. Anthropic averages all signed-in accounts.', children: summary(p) + ' combined' })
         ]
       }),
-      ...rows
+      jsx('table', {
+        style: { width: '100%', borderCollapse: 'collapse', tableLayout: 'fixed' },
+        children: [
+          jsx('thead', { key: 'head', children: jsx('tr', { children: [jsx('th', { key: 'account', scope: 'col', style: { width: '20%' }, children: '' }), heading('Session'), heading('Weekly')] }) }),
+          jsx('tbody', { key: 'body', children: rows.map(a => jsx('tr', {
+            key: a.label,
+            children: [
+              jsx('th', { scope: 'row', style: { textAlign: 'left', fontSize: 12, fontWeight: 500, padding: '7px 0', verticalAlign: 'top' }, children: p.id === 'anthropic' ? a.label : 'Account' }),
+              jsx(QuotaCell, { window: p.status === 'ok' ? a.session : null }),
+              jsx(QuotaCell, { window: p.status === 'ok' ? a.weekly : null })
+            ]
+          })) })
+        ]
+      }),
+      p.status !== 'ok' ? jsx('div', { style: { fontSize: 10, color: 'var(--ui-text-tertiary)' }, children: 'Usage unavailable' }) : null,
+      p.stale && (p.hold_until || p.fetched_at)
+        ? jsx('div', { style: { fontSize: 10, color: 'var(--ui-text-tertiary)' }, children: [
+            p.fetched_at ? 'last reading ' + clockTime(p.fetched_at) : null,
+            p.hold_until ? 'retry after ' + clockTime(p.hold_until) : null
+          ].filter(Boolean).join(' · ') })
+        : null,
+      p.status === 'ok' && p.id === 'opencode-go' && rows[0] && rows[0].monthly
+        ? jsx('div', { style: { fontSize: 10, color: 'var(--ui-text-tertiary)' }, children: 'Monthly ' + pct(remaining(rows[0].monthly)) + ' left' + (etaText(rows[0].monthly.resets_at) ? ' · ' + etaText(rows[0].monthly.resets_at) : '') + '. Combined = lowest of 5h, weekly, monthly.' })
+        : null,
+      p.status === 'ok' && rows.some(a => a.missing)
+        ? jsx('div', { style: { fontSize: 10, color: 'var(--ui-text-tertiary)' }, children: rows.filter(a => a.missing).map(a => a.label).join(', ') + ' unavailable, counted as 0%' })
+        : null
     ]
   })
 }
@@ -612,7 +611,7 @@ function UsagePanel() {
       ? 'unreachable'
       : 'loading…'
 
-  const provs = data && Array.isArray(data.providers) ? data.providers : []
+  const provs = displayProviders(data)
   const body = []
   const ids = provs.map(x => x.id)
   provs.forEach((p, i) => body.push(jsx(ProviderBlock, { p, first: i === 0, mode, ids }, p.id)))
@@ -623,14 +622,14 @@ function UsagePanel() {
   }
 
   return jsxs('div', {
-    style: { display: 'flex', width: 320, flexDirection: 'column', gap: 9, padding: '11px 12px 10px', fontSize: 12 },
+    style: { display: 'flex', width: 320, flexDirection: 'column', gap: 12, padding: '14px 16px 12px', fontSize: 12 },
     children: [
       jsx('style', { key: 'kf', children: '@keyframes hermes-usage-spin{to{transform:rotate(360deg)}}' }),
       jsxs('div', {
         key: 'head',
         style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 },
         children: [
-          jsx('span', { style: { fontSize: 12, fontWeight: 650 }, children: 'Provider Usage' }),
+          jsx('span', { style: { fontSize: 12, fontWeight: 650 }, children: 'Remaining capacity' }),
           jsxs('span', {
             style: { display: 'inline-flex', alignItems: 'center', gap: 6, fontSize: 11, opacity: 0.75 },
             children: [
@@ -670,7 +669,7 @@ function UsagePanel() {
         },
         children: [
           jsx(IntervalSelect, { onChanged: () => qc.refetchQueries({ queryKey: USAGE_KEY }) }, 'int'),
-          jsx(ModeSelect, {}, 'mode')
+          jsx('span', { style: { color: 'var(--ui-text-tertiary)' }, children: 'Remaining %' }, 'mode')
         ]
       })
     ]
@@ -697,7 +696,7 @@ export default {
   register(ctx) {
     if (!storage) bindStorage(ctx.storage)
     try {
-      osNotify = ctx.os && typeof ctx.os.notify === 'function' ? ctx.os.notify.bind(ctx.os) : null
+      osNotify = null // this compact layout keeps native notifications off
     } catch (e) {
       osNotify = null
     }
@@ -708,14 +707,14 @@ export default {
     }
     ctx.register({
       id: 'status',
-      area: STATUSBAR_AREAS.right,
+      area: STATUSBAR_AREAS.left,
       order: 40,
       data: {
         id: 'provider-usage',
         icon: ICON,
         detail: jsx(BarDetail, {}),
         variant: 'menu',
-        menuAlign: 'end',
+        menuAlign: 'start',
         menuClassName: 'w-auto border-(--ui-stroke-secondary) p-0',
         menuContent: () => jsx(UsagePanel, {}),
         title: jsx(BarTip, {}),

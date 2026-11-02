@@ -283,6 +283,8 @@ class AnthropicFetcherTest(unittest.TestCase):
         API.HOME = self.home
         self._orig_http = API._http_json
         self._orig_hermes = API._hermes_usage
+        self._orig_pool_accounts = API._hermes_anthropic_oauth_accounts
+        API._hermes_anthropic_oauth_accounts = lambda: []
         self.calls = []
         self.headers_seen = []
 
@@ -290,6 +292,7 @@ class AnthropicFetcherTest(unittest.TestCase):
         API.HOME = self._orig_home
         API._http_json = self._orig_http
         API._hermes_usage = self._orig_hermes
+        API._hermes_anthropic_oauth_accounts = self._orig_pool_accounts
         self._tmp.cleanup()
 
     def _no_hermes(self):
@@ -367,8 +370,10 @@ class AnthropicFetcherTest(unittest.TestCase):
         self._no_hermes()
         self._write_creds({"claudeAiOauth": {"accessToken": "test-token"}})
         self._mock_http({"five_hour": {"resets_at": "2026-10-02T07:06:00+00:00"}})
-        with self.assertRaises(API._Skip):
-            API.fetch_anthropic()
+        p = API.fetch_anthropic()
+        self.assertEqual(len(p["windows"]), 1)
+        self.assertEqual(p["windows"][0]["label"], "5h")
+        self.assertEqual(p["windows"][0]["percent"], 0.0)
 
     def test_partial_windows_only_render_present_rows(self):
         self._no_hermes()
